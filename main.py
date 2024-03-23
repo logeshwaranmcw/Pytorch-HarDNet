@@ -21,6 +21,14 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torch.nn.init as init
 from hardnet import *
+import pytest
+import urllib, requests
+import onnx
+import onnxruntime
+from PIL import Image
+from torchvision import transforms
+import scipy.stats
+from tqdm import tqdm
 
 model_names = ['hardnet39ds', 'hardnet68ds', 'hardnet68', 'hardnet85']
 
@@ -209,7 +217,7 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
     elif not args.pretrained:
         model.apply(weights_init)
-        
+
     total_params = sum(p.numel() for p in model.parameters())
 
     print( "Parameters=", total_params )
@@ -221,23 +229,23 @@ def main_worker(gpu, ngpus_per_node, args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    # train_dataset = datasets.ImageFolder(
+    #     traindir,
+    #     transforms.Compose([
+    #         transforms.RandomResizedCrop(224),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         normalize,
+    #     ]))
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+    #     num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
@@ -455,10 +463,117 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+        return tuple(res)
+
+
+
+
+variants = ["hardnet68", "hardnet85", "hardnet68ds", "hardnet39ds"]
+
+#onnx exporting
+@pytest.mark.parametrize("variant", variants)
+def test_export_torch_to_onnx(val_loader,variant):
+
+    correct_onnx_top1 = 0
+    correct_onnx_top5 = 0
+    total_onnx = 0
+
+    # load only the model architecture without pre-trained weights.
+    model = torch.hub.load("PingoLH/Pytorch-HarDNet", variant, pretrained=False)
+
+    # # weights downloaded from https://github.com/PingoLH/Pytorch-HarDNet
+    checkpoint_path = f"{variant}.pth"
+
+    # # Load weights from the checkpoint file and maps tensors to CPU, ensuring compatibility even without a GPU.
+    state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+
+    # Inject weights into model
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    # Prepare input
+    url, filename = (
+        "https://github.com/pytorch/hub/raw/master/images/dog.jpg",
+        "dog.jpg",
+    )
+    try:
+        urllib.URLopener().retrieve(url, filename)
+    except:
+        urllib.request.urlretrieve(url, filename)
+
+    input_image = Image.open(filename)
+
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    input_tensor = preprocess(input_image)
+    input_batch = input_tensor.unsqueeze(0)
+
+    # PyTorch inference
+    with torch.no_grad():
+        torch_output = model(input_batch)
+
+    # Export and save the ONNX model
+    torch.onnx.export(
+        model,
+        (input_batch),
+        f"{variant}.onnx",
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=["pixel_values"],
+        output_names=["predictions"],
+    )
+    ort_session = onnxruntime.InferenceSession(variant+".onnx")
+    for images, labels in val_loader:
+                inputs_onnx = {ort_session.get_inputs()[0].name: images.cpu().numpy()}
+                outputs_onnx = ort_session.run(None, inputs_onnx)
+                _, predicted_onnx = torch.max(torch.tensor(outputs_onnx[0]), 1)
+
+                # Move labels to the same device as predicted_onnx
+                labels = labels.to(predicted_onnx.device)
+
+                # Top-1 accuracy
+                total_onnx += labels.size(0)
+                correct_onnx_top1 += (predicted_onnx == labels).sum().item()
+
+                # Top-5 accuracy
+                _, predicted_top5_onnx = torch.topk(torch.tensor(outputs_onnx[0]), 5, dim=1)
+                correct_onnx_top5 += torch.sum(predicted_top5_onnx == labels.view(-1, 1)).item()
+
+
+                # Calculate accuracy for ONNX model
+                accuracy_onnx_top1 = correct_onnx_top1 / total_onnx
+                accuracy_onnx_top5 = correct_onnx_top5 / total_onnx
+
+    print("Accuracy of {} FP32 PyTorch model on the ImageNet validation set (Top-1): {:.2%}".format(variant, accuracy_onnx_top1))
+    print("Accuracy of {} FP32 PyTorch model on the ImageNet validation set (Top-5): {:.2%}".format(variant, accuracy_onnx_top5))
+
 
 
 if __name__ == '__main__':
     main()
+    valdir="/DATA/ModelQuantization/dataset/ImageNet"
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    val_loader = torch.utils.data.DataLoader(
+        datasets.ImageFolder(valdir, transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ])),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
+
+    test_export_torch_to_onnx(variant="hardnet68")
+    test_export_torch_to_onnx(variant="hardnet85")
+    test_export_torch_to_onnx(variant="hardnet68ds")
+    test_export_torch_to_onnx(variant="hardnet39ds")
